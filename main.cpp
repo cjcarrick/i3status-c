@@ -30,31 +30,16 @@ bool is_num(const char &c)
 }
 
 /**
- * Where n > 1, change n so that 1000 > n > 1, and 'prefix' represents an SI
- * prefix.
+ * Convert n to a string of at least length w (*)
  *
- * Ex: 1000  -> 1, k
- * Ex: 84920 -> 84.92, k
- */
-double si_prefix(double n, char &prefix)
-{
-    int i = 0;
-    while (n >= 1000) {
-        n /= 1000;
-        i++;
-    }
-    prefix = SI_PREFIXES[i];
-    return n;
-}
-
-/**
- * Where n > 1, change n so that 1000 > n > 1, and 'prefix' represents an SI
- * prefix.
+ * - If the integer part of n is too big to fit in w, then the resulting string
+ *   will be bigger than w
+ * - set si_prefix to true to convert n to be between 1 and 1000, and add an SI
+ *   prefix. Ex: (4193885, 4) becomes 4.1M instead of 4193885
  *
- * Ex: 1000  -> 1, k
- * Ex: 84920 -> 84.92, k
+ * (*) a string that is USUALLY of length n. In some cases it can be n-1.
  */
-string tofixed(double n, int w)
+string tofixed(double n, int w, bool si_prefix = true)
 {
     string s;
     bool negative = false;
@@ -65,9 +50,26 @@ string tofixed(double n, int w)
         n = -n;
     }
 
+    int prefix = 0;
+    if (si_prefix) {
+        while (n >= 1000) {
+            n /= 1000;
+            prefix++;
+        }
+    }
+    if (prefix > 0) {
+        w -= 1;
+    }
+
     if (n < 1 && n > -1) {
-        s += "0.";
-        w -= 2;
+        if (w >= 3) {
+            s += "0.";
+            w -= 2;
+        } else {
+            s += "0";
+            w -= 1;
+            goto finish;
+        }
     }
 
     else {
@@ -84,7 +86,12 @@ string tofixed(double n, int w)
             w -= 1;
         }
 
-        if (w == 0) goto finish;
+        // Note:
+        // - With w <= 0, inputs (1234567, 3) produce "1.M"
+        // - With w <= 1, inputs (1234567, 3) produce "1M"
+        // The former is technically probably right but it looks weird so i'm
+        // using the latter
+        if (w <= 1) goto finish;
 
         s += '.';
         w -= 1;
@@ -95,13 +102,25 @@ string tofixed(double n, int w)
     }
 
     // Do as much of the decimal part as we can in order to fit
-    for (int i = 0; i < w; i++) {
+    for (int i = 0; i <= w; i++) {
         n *= 10;
         s = s + char(int(n) % 10 + '0');
+        w -= 1;
     }
 
 finish:
-    return (negative ? "-" : "") + s;
+    if (negative) {
+        s = '-' + s;
+    }
+    if (prefix) {
+        s = s + SI_PREFIXES[prefix];
+    }
+    while (w > 0) {
+        // Pad left with spaces; fix for this issue described above
+        s = ' ' + s;
+        w --;
+    }
+    return s;
 }
 
 /** num is converted to string and appended to str. Guaranteed to have length of
@@ -322,7 +341,6 @@ int main()
     char ip_addr[15];
     time_t timer;
     std::tm *timer_struct = nullptr;
-    char prefix = ' ';
 
     get_disk(disk_util);
     get_mem(mem_used, swap_used);
@@ -335,36 +353,36 @@ int main()
     /** Seconds since start of program */
     int t = 0;
 
-while (1) {
-    timer = time(nullptr);
-    timer_struct = localtime(&timer);
+    while (1) {
+        timer = time(nullptr);
+        timer_struct = localtime(&timer);
 
-    if (t % 4 == 0) {
-        get_gpu(vram_used, gpu_usage, gpu_temp, gpu_speed);
-        get_mem(mem_used, swap_used);
-        get_cpu_util(cpu_usage, last_time_used, last_time_idle);
-        get_cpu_speed(cpu_speed);
-        get_cpu_temp(cpu_temp);
-    }
+        if (t % 4 == 0) {
+            get_gpu(vram_used, gpu_usage, gpu_temp, gpu_speed);
+            get_mem(mem_used, swap_used);
+            get_cpu_util(cpu_usage, last_time_used, last_time_idle);
+            get_cpu_speed(cpu_speed);
+            get_cpu_temp(cpu_temp);
+        }
 
-    if (t % 30 == 0) {
-        get_disk(disk_util);
-    }
+        if (t % 30 == 0) {
+            get_disk(disk_util);
+        }
 
-    // clang-format off
+        // clang-format off
         cout
             << "NET: " << ip_addr << " | "
-            << "CPU: "  << tofixed(cpu_usage * 100,                        4) << "% " << tofixed(cpu_temp / 1000, 4) << "° " << tofixed(si_prefix(cpu_speed * 1000000, prefix), 3) << prefix << " │ "
-            << "GPU: "  << tofixed(gpu_usage,                              4) << "% " << gpu_temp << "° " << si_prefix(gpu_speed * 1000000, prefix) << prefix << " │ "
-            << "VRAM: " << tofixed(si_prefix(vram_used * 1000000, prefix), 4) << prefix << " │ "
-            << "MEM: "  << tofixed(si_prefix(mem_used * 1000,     prefix), 4) << prefix << " │ "
-            << "SWAP: " << tofixed(si_prefix(swap_used,           prefix), 4) << prefix << " │ "
-            << "/: "    << tofixed(si_prefix(disk_util,           prefix), 4) << prefix << " │ "
+            << "CPU: "  << tofixed(cpu_usage * 100,     4, false) << "% " << tofixed(cpu_temp / 1000, 4) << "° " << tofixed(cpu_speed * 1000000, 4) << " │ "
+            << "GPU: "  << tofixed(gpu_usage,           4, false) << "% " << gpu_temp << "° " << tofixed(gpu_speed * 1000000, 4) << " │ "
+            << "VRAM: " << tofixed(vram_used * 1000000, 4) << " │ "
+            << "MEM: "  << tofixed(mem_used * 1000,     4) << " │ "
+            << "SWAP: " << tofixed(swap_used,           4) << " │ "
+            << "/: "    << tofixed(disk_util,           5) << " │ "
             << WEEKDAYS[timer_struct->tm_wday] << ", " << MONTHS[timer_struct->tm_mon] << " " << timer_struct->tm_mday << " "
             << timer_struct->tm_hour << ":" << num_to_str(timer_struct->tm_min, 2) << ":" << num_to_str(timer_struct->tm_sec, 2) << endl;
-    // clang-format on
+        // clang-format on
 
-    sleep(1);
-    t++;
-}
+        sleep(1);
+        t++;
+    }
 }
