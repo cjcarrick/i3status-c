@@ -379,7 +379,7 @@ int main()
             << "SWAP: " << tofixed(swap_used,           4) << " │ "
             << "/: "    << tofixed(disk_util,           5) << " │ "
             << WEEKDAYS[timer_struct->tm_wday] << ", " << MONTHS[timer_struct->tm_mon] << " " << timer_struct->tm_mday << " "
-            << timer_struct->tm_hour << ":" << num_to_str(timer_struct->tm_min, 2) << ":" << num_to_str(timer_struct->tm_sec, 2) << endl;
+            << timer_struct->tm_hour % 12 << ":" << num_to_str(timer_struct->tm_min, 2) << ":" << num_to_str(timer_struct->tm_sec, 2) << endl;
         // clang-format on
 
         sleep(1);
