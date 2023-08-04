@@ -1,16 +1,21 @@
+#define BENCH 1
+
 #include <fstream>
+#include <functional>
 #include <ifaddrs.h>
 #include <iomanip>
 #include <iostream>
 #include <net/if.h>
 #include <netdb.h>
 #include <sys/statfs.h>
+#include <thread>
 #include <unistd.h>
 
 using std::cerr;
 using std::cout;
 using std::endl;
 using std::string;
+using std::thread;
 
 const string MONTHS[12] = {
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Nov", "Dec",
@@ -65,7 +70,8 @@ string tofixed(double n, int w, bool si_prefix = true)
         if (w >= 3) {
             s += "0.";
             w -= 2;
-        } else {
+        }
+        else {
             s += "0";
             w -= 1;
             goto finish;
@@ -118,15 +124,14 @@ finish:
     while (w > 0) {
         // Pad left with spaces; fix for this issue described above
         s = ' ' + s;
-        w --;
+        w--;
     }
     return s;
 }
 
 /** num is converted to string and appended to str. Guaranteed to have length of
  * `pad` or greater. `pad` will pad the string with leading zeroes. */
-template <typename T>
-string num_to_str(T num, int pad = 0)
+template <typename T> string num_to_str(T num, int pad = 0)
 {
     string s;
     while (num > 0) {
@@ -142,15 +147,15 @@ string num_to_str(T num, int pad = 0)
 }
 
 /** Determine used disk space at / */
-void get_disk(double &used)
+void get_disk(double *used)
 {
     struct statfs a;
     statfs("/", &a);
-    used = (a.f_blocks - a.f_bfree) * a.f_bsize;
+    *used = (a.f_blocks - a.f_bfree) * a.f_bsize;
 }
 
 /** nvidia-smi */
-void get_gpu(int &vram_used, int &gpu_usage, int &gpu_temp, int &gpu_speed)
+void get_gpu(int *vram_used, int *gpu_usage, int *gpu_temp, int *gpu_speed)
 {
     FILE *subproc = popen(
         "nvidia-smi "
@@ -164,27 +169,27 @@ void get_gpu(int &vram_used, int &gpu_usage, int &gpu_temp, int &gpu_speed)
     );
     char c;
 
-    vram_used = 0;
+    *vram_used = 0;
     while (is_num(c = fgetc(subproc))) {
-        vram_used = vram_used * 10 + (c - '0');
+        *vram_used = *vram_used * 10 + (c - '0');
     }
     fgetc(subproc); // Skip space
 
-    gpu_usage = 0;
+    *gpu_usage = 0;
     while (is_num(c = fgetc(subproc))) {
-        gpu_usage = gpu_usage * 10 + (c - '0');
+        *gpu_usage = *gpu_usage * 10 + (c - '0');
     }
     fgetc(subproc); // Skip space
 
-    gpu_temp = 0;
+    *gpu_temp = 0;
     while (is_num(c = fgetc(subproc))) {
-        gpu_temp = gpu_temp * 10 + (c - '0');
+        *gpu_temp = *gpu_temp * 10 + (c - '0');
     }
     fgetc(subproc); // Skip space
 
-    gpu_speed = 0;
+    *gpu_speed = 0;
     while (is_num(c = fgetc(subproc))) {
-        gpu_speed = gpu_speed * 10 + (c - '0');
+        *gpu_speed = *gpu_speed * 10 + (c - '0');
     }
 
     pclose(subproc);
@@ -223,7 +228,7 @@ void get_net(char *ip_address)
 }
 
 /** reads /proc/meminfo */
-void get_mem(long int &mem_used, long int &swap_used)
+void get_mem(long int *mem_used, long int *swap_used)
 {
     std::ifstream f("/proc/meminfo");
 
@@ -259,7 +264,7 @@ void get_mem(long int &mem_used, long int &swap_used)
         f >> l;
     }
     f >> mem_free;
-    mem_used = mem_total - mem_free;
+    *mem_used = mem_total - mem_free;
 
     long int swap_total, swap_free;
     while (l != "SwapTotal:") {
@@ -279,11 +284,11 @@ void get_mem(long int &mem_used, long int &swap_used)
     }
     f >> swap_free;
     f.close();
-    swap_used = swap_total - swap_free;
+    *swap_used = swap_total - swap_free;
 }
 
 /** reads /proc/cpuinfo */
-void get_cpu_speed(double &cpu_speed)
+void get_cpu_speed(double *cpu_speed)
 {
     string s;
     std::ifstream f("/proc/cpuinfo");
@@ -295,20 +300,21 @@ void get_cpu_speed(double &cpu_speed)
         f >> s;
     }
     f >> s; // skip colon
-    f >> cpu_speed;
+    f >> *cpu_speed;
 }
 
 /** reads /sys/class/hwmon */
-void get_cpu_temp(double&cpu_temp) {
+void get_cpu_temp(double *cpu_temp)
+{
     std::ifstream f("/sys/class/hwmon/hwmon0/temp1_input");
-    f >> cpu_temp;
+    f >> *cpu_temp;
 }
 
 /** reads /proc/stat */
 void get_cpu_util(
-    double &cpu_util,
-    double &last_time_used,
-    double &last_time_idle
+    double *cpu_util,
+    double *last_time_used,
+    double *last_time_idle
 )
 {
     string _label;
@@ -318,44 +324,57 @@ void get_cpu_util(
     f >> _label >> user >> nice >> system >> idle;
     f.close();
 
-    if (last_time_idle > 0) {
-        cpu_util =
-            (user + nice + system - last_time_used) / (idle - last_time_idle);
+    if (*last_time_idle > 0) {
+        *cpu_util =
+            (user + nice + system - *last_time_used) / (idle - *last_time_idle);
         // cout << (user + nice + system - last_time_used) << (idle -
         // last_time_idle) << endl; cout << utilization << endl;
     }
 
-    last_time_used = user + nice + system;
-    last_time_idle = idle;
+    *last_time_used = user + nice + system;
+    *last_time_idle = idle;
 }
 
 int main()
 {
-    double last_time_used = 0, last_time_idle = 0, cpu_usage = 0, cpu_speed,
-           cpu_temp;
-    long int mem_used;
-    long int swap_used;
-    int gpu_speed, gpu_usage, gpu_temp;
-    int vram_used;
-    double disk_util;
+    double *last_time_used = new double(0), *last_time_idle = new double(0),
+           *cpu_usage = new double, *cpu_speed = new double,
+           *cpu_temp = new double;
+    long int *mem_used = new long int;
+    long int *swap_used = new long int;
+    int *gpu_speed = new int, *gpu_usage = new int, *gpu_temp = new int;
+    int *vram_used = new int;
+    double *disk_util = new double;
     char ip_addr[15];
     time_t timer;
     std::tm *timer_struct = nullptr;
 
-    get_disk(disk_util);
-    get_mem(mem_used, swap_used);
-    get_gpu(vram_used, gpu_usage, gpu_temp, gpu_speed);
-    get_net(ip_addr);
-    get_cpu_util(cpu_usage, last_time_used, last_time_idle);
-    get_cpu_speed(cpu_speed);
-    get_cpu_temp(cpu_temp);
+    thread disk_t(get_disk, disk_util);
+    thread mem_t(get_mem, mem_used, swap_used);
+    thread gpu_t(get_gpu, vram_used, gpu_usage, gpu_temp, gpu_speed);
+    thread net_t(get_net, ip_addr);
+    thread cpu_utl_t(get_cpu_util, cpu_usage, last_time_used, last_time_idle);
+    thread cpu_speed_t(get_cpu_speed, cpu_speed);
+    thread cpu_temp_t(get_cpu_temp, cpu_temp);
 
+#ifndef BENCH
     /** Seconds since start of program */
     int t = 0;
+#endif
 
+    timer = time(nullptr);
+    timer_struct = localtime(&timer);
+
+    disk_t.join();
+    mem_t.join();
+    gpu_t.join();
+    net_t.join();
+    cpu_utl_t.join();
+    cpu_speed_t.join();
+    cpu_temp_t.join();
+
+#ifndef BENCH
     while (1) {
-        timer = time(nullptr);
-        timer_struct = localtime(&timer);
 
         if (t % 4 == 0) {
             get_gpu(vram_used, gpu_usage, gpu_temp, gpu_speed);
@@ -369,20 +388,25 @@ int main()
             get_disk(disk_util);
         }
 
-        // clang-format off
-        cout
-            << "NET: " << ip_addr << " | "
-            << "CPU: "  << tofixed(cpu_usage * 100,     4, false) << "% " << tofixed(cpu_temp / 1000, 4) << "° " << tofixed(cpu_speed * 1000000, 4) << " │ "
-            << "GPU: "  << tofixed(gpu_usage,           4, false) << "% " << gpu_temp << "° " << tofixed(gpu_speed * 1000000, 4) << " │ "
-            << "VRAM: " << tofixed(vram_used * 1000000, 4) << " │ "
-            << "MEM: "  << tofixed(mem_used * 1000,     4) << " │ "
-            << "SWAP: " << tofixed(swap_used,           4) << " │ "
-            << "/: "    << tofixed(disk_util,           5) << " │ "
-            << WEEKDAYS[timer_struct->tm_wday] << ", " << MONTHS[timer_struct->tm_mon] << " " << timer_struct->tm_mday << " "
-            << timer_struct->tm_hour % 12 << ":" << num_to_str(timer_struct->tm_min, 2) << ":" << num_to_str(timer_struct->tm_sec, 2) << endl;
+#endif
+
+    // clang-format off
+    cout
+        << "NET: " << ip_addr << " | "
+        << "CPU: "  << tofixed(*cpu_usage * 100,     4, false) << "% " << tofixed(*cpu_temp / 1000, 4) << "° " << tofixed(*cpu_speed * 1000000, 4) << " │ "
+        << "GPU: "  << tofixed(*gpu_usage,           4, false) << "% " << *gpu_temp << "° " << tofixed(*gpu_speed * 1000000, 4) << " │ "
+        << "VRAM: " << tofixed(*vram_used * 1000000, 4) << " │ "
+        << "MEM: "  << tofixed(*mem_used * 1000,     4) << " │ "
+        << "SWAP: " << tofixed(*swap_used,           4) << " │ "
+        << "/: "    << tofixed(*disk_util,           5) << " │ "
+        << WEEKDAYS[timer_struct->tm_wday] << ", " << MONTHS[timer_struct->tm_mon] << " " << timer_struct->tm_mday << " "
+        << timer_struct->tm_hour % 12 << ":" << num_to_str(timer_struct->tm_min, 2) << ":" << num_to_str(timer_struct->tm_sec, 2) << endl;
         // clang-format on
 
+#ifndef BENCH
         sleep(1);
+
         t++;
     }
+#endif
 }

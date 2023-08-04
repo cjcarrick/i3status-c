@@ -21,3 +21,16 @@ bar {
   status_command /usr/local/bin/i3status-c
 }
 ```
+
+## Performance of Multithreaded Branch
+
+Hyperfine results on Intel 8600k (6 cores, 5GHz)
+
+### Single threaded (from main branch)
+  Time (mean ± σ):      52.1 ms ±  19.2 ms    [User: 19.2 ms, System: 21.7 ms]
+  Range (min … max):    24.1 ms …  90.1 ms    96 runs
+
+### Multithreaded
+  Time (mean ± σ):      29.1 ms ±  10.6 ms    [User: 10.7 ms, System: 14.1 ms]
+  Range (min … max):    11.4 ms …  50.8 ms    119 runs
+
