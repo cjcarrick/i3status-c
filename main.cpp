@@ -1,5 +1,3 @@
-#define BENCH 1
-
 #include <fstream>
 #include <functional>
 #include <ifaddrs.h>
@@ -362,9 +360,6 @@ int main()
     int t = 0;
 #endif
 
-    timer = time(nullptr);
-    timer_struct = localtime(&timer);
-
     disk_t.join();
     mem_t.join();
     gpu_t.join();
@@ -376,31 +371,43 @@ int main()
 #ifndef BENCH
     while (1) {
 
-        if (t % 4 == 0) {
-            get_gpu(vram_used, gpu_usage, gpu_temp, gpu_speed);
-            get_mem(mem_used, swap_used);
-            get_cpu_util(cpu_usage, last_time_used, last_time_idle);
-            get_cpu_speed(cpu_speed);
-            get_cpu_temp(cpu_temp);
-        }
+        timer = time(nullptr);
+        timer_struct = localtime(&timer);
 
-        if (t % 30 == 0) {
-            get_disk(disk_util);
+        if (t % 4 == 0) {
+            thread gpu_t(get_gpu, vram_used, gpu_usage, gpu_temp, gpu_speed);
+            thread mem_t(get_mem, mem_used, swap_used);
+            thread cpu_util_t(get_cpu_util, cpu_usage, last_time_used, last_time_idle);
+            thread cpu_speed_t(get_cpu_speed, cpu_speed);
+            thread cpu_temp_t(get_cpu_temp, cpu_temp);
+
+            if (t % 28 == 0) {
+                thread disk_t(get_disk, disk_util);
+                thread net_t(get_net, ip_addr);
+                disk_t.join();
+                net_t.join();
+            }
+
+            gpu_t.join();
+            mem_t.join();
+            cpu_util_t.join();
+            cpu_speed_t.join();
+            cpu_temp_t.join();
         }
 
 #endif
 
-    // clang-format off
-    cout
-        << "NET: " << ip_addr << " | "
-        << "CPU: "  << tofixed(*cpu_usage * 100,     4, false) << "% " << tofixed(*cpu_temp / 1000, 4) << "° " << tofixed(*cpu_speed * 1000000, 4) << " │ "
-        << "GPU: "  << tofixed(*gpu_usage,           4, false) << "% " << *gpu_temp << "° " << tofixed(*gpu_speed * 1000000, 4) << " │ "
-        << "VRAM: " << tofixed(*vram_used * 1000000, 4) << " │ "
-        << "MEM: "  << tofixed(*mem_used * 1000,     4) << " │ "
-        << "SWAP: " << tofixed(*swap_used,           4) << " │ "
-        << "/: "    << tofixed(*disk_util,           5) << " │ "
-        << WEEKDAYS[timer_struct->tm_wday] << ", " << MONTHS[timer_struct->tm_mon] << " " << timer_struct->tm_mday << " "
-        << timer_struct->tm_hour % 12 << ":" << num_to_str(timer_struct->tm_min, 2) << ":" << num_to_str(timer_struct->tm_sec, 2) << endl;
+        // clang-format off
+        cout
+            << "NET: " << ip_addr << " | "
+            << "CPU: "  << tofixed(*cpu_usage * 100,     4, false) << "% " << tofixed(*cpu_temp / 1000, 4) << "° " << tofixed(*cpu_speed * 1000000, 4) << " │ "
+            << "GPU: "  << tofixed(*gpu_usage,           4, false) << "% " << *gpu_temp << "° " << tofixed(*gpu_speed * 1000000, 4) << " │ "
+            << "VRAM: " << tofixed(*vram_used * 1000000, 4) << " │ "
+            << "MEM: "  << tofixed(*mem_used * 1000,     4) << " │ "
+            << "SWAP: " << tofixed(*swap_used,           4) << " │ "
+            << "/: "    << tofixed(*disk_util,           5) << " │ "
+            << WEEKDAYS[timer_struct->tm_wday] << ", " << MONTHS[timer_struct->tm_mon] << " " << timer_struct->tm_mday << " "
+            << timer_struct->tm_hour - (timer_struct->tm_hour > 12 ? 1 : 0) << ":" << num_to_str(timer_struct->tm_min, 2) << ":" << num_to_str(timer_struct->tm_sec, 2) << endl;
         // clang-format on
 
 #ifndef BENCH
