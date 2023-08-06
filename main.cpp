@@ -150,7 +150,7 @@ void get_disk(double &used)
 }
 
 /** nvidia-smi */
-void get_gpu(int &vram_used, int &gpu_usage, int &gpu_temp, int &gpu_speed)
+void get_gpu(long int &vram_used, int &gpu_usage, int &gpu_temp, int &gpu_speed)
 {
     FILE *subproc = popen(
         "nvidia-smi "
@@ -336,7 +336,7 @@ int main()
     long int mem_used;
     long int swap_used;
     int gpu_speed, gpu_usage, gpu_temp;
-    int vram_used;
+    long int vram_used;
     double disk_util;
     char ip_addr[15];
     time_t timer;
