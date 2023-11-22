@@ -1,10 +1,14 @@
-CXX = g++
-CXXFLAGS = -std=c++17 -Wall
+CC = gcc
+CFLAGS = -Wall -lm -lpthread
 
 ifdef DEBUG
-CXXFLAGS += -g
+CFLAGS += -g
 else
-CXXFLAGS += -O3
+CFLAGS += -O3
+endif
+
+ifdef PROFILE
+CFLAGS += -D PROFILE=1
 endif
 
 build: i3status-c
@@ -15,9 +19,9 @@ install: build
 uninstall:
 	rm /usr/local/bin/i3status-c
 
-i3status-c: main.cpp
-	$(CXX) $(CXXFLAGS) main.cpp -o i3status-c
+i3status-c: main.c
+	$(CC) $(CFLAGS) main.c -o i3status-c
 
 clean:
-	rm -rf i3status-c i3status-c.dSYM
+	rm -rf i3status-c i3status-c.dSYM test
 
