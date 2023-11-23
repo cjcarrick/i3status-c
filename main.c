@@ -1,3 +1,4 @@
+#include "/opt/cuda/targets/x86_64-linux/include/nvml.h"
 #include <assert.h>
 #include <bits/pthreadtypes.h>
 #include <ifaddrs.h>
@@ -21,7 +22,7 @@ const char WEEKDAYS[7][3] = {
 };
 
 char output[] = " | CPU: 0000% 0000° 0000 | GPU: 0000% 00° 0000 | VRAM: "
-                "0000 | MEM: 0000 | /: 00000 | WKD, MNT DD hh:mm:ss\n";
+                "0000 | MEM: 0000 | /: 00000 | WKD, MNT DD hh:mm:ss";
 
 #define CPU_UTIL 8
 #define CPU_TEMP CPU_UTIL + 6
@@ -45,13 +46,19 @@ const char SI_PREFIXES[8] = {'K', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y'};
 double last_time_used = 0, last_time_idle = 0, cpu_util = 0, cpu_speed,
        cpu_temp;
 long int mem_used;
-int gpu_speed, gpu_usage, gpu_temp;
 long int vram_used;
 double disk_util;
 char ip_addr[15], vpn[96];
 size_t ip_addr_len = 0, vpn_len = 0;
 time_t timer;
 struct tm *timer_struct = NULL;
+
+nvmlReturn_t nvml_result;
+nvmlDevice_t nvml_device;
+nvmlMemory_t nvml_mem;
+unsigned int nvml_temp;
+nvmlUtilization_t nvml_util;
+unsigned int nvml_clocks;
 
 int is_num(char c)
 {
@@ -200,55 +207,27 @@ void *get_disk(void *_)
     return NULL;
 }
 
-/** nvidia-smi */
-FILE *gpu_subproc;
 void *get_gpu(void *_)
 {
 #ifdef PROFILE
     clock_t start = clock();
 #endif
 
-    gpu_subproc = popen(
-        "/usr/bin/nvidia-smi "
-        "--query-gpu="
-        "memory.used,"
-        "utilization.memory,"
-        "temperature.gpu,"
-        "clocks.current.graphics "
-        "--format=csv,noheader,nounits",
-        "r"
-    );
-    char c;
+    nvml_result = nvmlDeviceGetMemoryInfo(nvml_device, &nvml_mem);
+    if (nvml_result != NVML_SUCCESS) return NULL;
+    tofixed(&output[VRAM], 4, nvml_mem.used);
 
-    vram_used = 0;
-    while (is_num(c = fgetc(gpu_subproc))) {
-        vram_used = vram_used * 10 + (c - '0');
-    }
-    fgetc(gpu_subproc); // Skip space
+    nvml_result = nvmlDeviceGetTemperature(nvml_device, NVML_TEMPERATURE_GPU, &nvml_temp);
+    if (nvml_result != NVML_SUCCESS) return NULL;
+    tofixed(&output[GPU_TEMP], 2, nvml_temp);
 
-    gpu_usage = 0;
-    while (is_num(c = fgetc(gpu_subproc))) {
-        gpu_usage = gpu_usage * 10 + (c - '0');
-    }
-    fgetc(gpu_subproc); // Skip space
+    nvml_result = nvmlDeviceGetUtilizationRates(nvml_device, &nvml_util);
+    if (nvml_result != NVML_SUCCESS) return NULL;
+    tofixed(&output[GPU_UTIL], 4, nvml_util.gpu);
 
-    gpu_temp = 0;
-    while (is_num(c = fgetc(gpu_subproc))) {
-        gpu_temp = gpu_temp * 10 + (c - '0');
-    }
-    fgetc(gpu_subproc); // Skip space
-
-    gpu_speed = 0;
-    while (is_num(c = fgetc(gpu_subproc))) {
-        gpu_speed = gpu_speed * 10 + (c - '0');
-    }
-
-    pclose(gpu_subproc);
-
-    tofixed(&output[GPU_UTIL], 4, gpu_usage);
-    tofixed(&output[GPU_TEMP], 2, gpu_temp);
-    tofixed(&output[GPU_SPEED], 4, gpu_speed * 1000000);
-    tofixed(&output[VRAM], 4, vram_used * 1000000);
+    nvml_result = nvmlDeviceGetClockInfo(nvml_device, NVML_CLOCK_GRAPHICS, &nvml_clocks);
+    if (nvml_result != NVML_SUCCESS) return NULL;
+    tofixed(&output[GPU_SPEED], 4, nvml_clocks * 1000000);
 
 #ifdef PROFILE
     printf("GPU: %ld\n", clock() - start);
@@ -333,7 +312,7 @@ void *get_mem(void *_)
 
     fclose(f);
 
-    tofixed(&output[MEM], 4, mem_used * 1000);
+    tofixed(&output[MEM], 4, mem_used);
 
 #ifdef PROFILE
     printf("Mem: %ld\n", clock() - start);
@@ -425,8 +404,6 @@ void *get_cpu_util(void *_)
     if (last_time_idle > 0) {
         cpu_util =
             (user + nice + system - last_time_used) / (idle - last_time_idle);
-        // cout << (user + nice + system - last_time_used) << (idle -
-        // last_time_idle) << endl; cout << utilization << endl;
     }
 
     last_time_used = user + nice + system;
@@ -443,11 +420,31 @@ void *get_cpu_util(void *_)
 
 int main(int argc, char **argv)
 {
+
     int one_shot = 0;
     for (int i = 0; i < argc; ++i) {
         if (strcmp(argv[i], "-1") == 0) {
             one_shot = 1;
         }
+    }
+
+    // initialize nvml library for get_gpu()
+    nvml_result = nvmlInit();
+    if (nvml_result != NVML_SUCCESS) {
+        printf(
+            "[nvml] Failed to initialize NVML: %s\n",
+            nvmlErrorString(nvml_result)
+        );
+        exit(1);
+    }
+
+    nvml_result = nvmlDeviceGetHandleByIndex(0, &nvml_device);
+    if (NVML_SUCCESS != nvml_result) {
+        printf(
+            "[nvml] Failed to get handle for device %u: %s\n", 0,
+            nvmlErrorString(nvml_result)
+        );
+        goto nvml_Error;
     }
 
     pthread_t threads[10];
@@ -478,18 +475,36 @@ int main(int argc, char **argv)
         // wait for any threads to finish
         for (int i = 0; i < thread_i; ++i) pthread_join(threads[i], NULL);
 
+        // check for any errors that might have happened in a thread
+        if (nvml_result != NVML_SUCCESS) {
+            printf("[nvml] %s\n", nvmlErrorString(nvml_result));
+            goto nvml_Error;
+        }
+
 #ifdef PROFILE
         printf("**TOTAL: %ld\n\n", clock() - start);
 #else
         fwrite("VPN: ", 1, 5, stdout);
         fwrite(vpn, 1, vpn_len, stdout);
-        fwrite(" | NET: ", 1, 5, stdout);
+        fwrite(" | NET: ", 1, 8, stdout);
         fwrite(ip_addr, 1, ip_addr_len, stdout);
         fwrite(output, 1, sizeof(output), stdout);
+        fflush(stdout);
 #endif
 
         if (one_shot) break;
 
         sleep(1);
     }
+
+    nvml_result = nvmlShutdown();
+    if (NVML_SUCCESS != nvml_result)
+        printf("Failed to shutdown NVML: %s\n", nvmlErrorString(nvml_result));
+    return 0;
+
+nvml_Error:
+    nvml_result = nvmlShutdown();
+    if (NVML_SUCCESS != nvml_result)
+        printf("Failed to shutdown NVML: %s\n", nvmlErrorString(nvml_result));
+    exit(1);
 }
