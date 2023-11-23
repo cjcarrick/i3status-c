@@ -119,12 +119,12 @@ void leftpad2(int n, char *str, char c)
  * `s'. Uses SI prefixes for numbers that are too big. As much of the decimal as
  * possible will be shown.
  */
-void tofixed(char *s, int w, double n)
+void tofixed(char *s, int w, long double n)
 {
     int postfix = 0;
-    while (n >= 1000) {
+    while (n >= 1024) {
         ++postfix;
-        n /= 1000;
+        n /= 1024;
     }
 
     if (n < 0) {
@@ -189,6 +189,7 @@ void get_vpn(char *str, size_t *len)
         fscanf(status, "%s", str);
         *len = strlen(str);
     }
+    pclose(status);
 }
 
 /** Determine used disk space at / */
@@ -317,7 +318,6 @@ void *get_mem(void *_)
 #ifdef PROFILE
     printf("Mem: %ld\n", clock() - start);
 #endif
-
     return NULL;
 }
 
