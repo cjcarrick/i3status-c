@@ -1,11 +1,8 @@
-CC = gcc
-CFLAGS = -Wall -lm -lpthread
+CC = clang
+CFLAGS = -Wall -lm -lpthread \
+	-Wno-int-to-pointer-cast -Wno-pointer-to-int-cast
 
-# nvml
-NVML_cudaroot=/usr/local/cuda-12.3
-NVML_libdir=${cudaroot}/targets/x86_64-linux/lib
-NVML_includedir=${cudaroot}/targets/x86_64-linux/include
-CFLAGS += -I${NVML_includedir} -lnvidia-ml -L$(NVML_libdir)/stubs
+CFLAGS += $(shell pkg-config --libs --cflags nvidia-ml)
 
 ifdef DEBUG
 CFLAGS += -g

@@ -1,100 +1,64 @@
 #include "/opt/cuda/targets/x86_64-linux/include/nvml.h"
 #include <assert.h>
 #include <bits/pthreadtypes.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <math.h>
 #include <net/if.h>
 #include <netdb.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
-const char MONTHS[12][3] = {
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Nov", "Dec",
-};
-
-const char WEEKDAYS[7][3] = {
-    "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat",
-};
-
-char output[] = " | CPU: 0000% 0000° 0000 | GPU: 0000% 00° 0000 | VRAM: "
-                "0000 | MEM: 0000 | /: 00000 | WKD, MNT DD hh:mm:ss";
-
-#define CPU_UTIL 8
-#define CPU_TEMP CPU_UTIL + 6
-#define CPU_SPEED CPU_TEMP + 7
-#define GPU_UTIL CPU_SPEED + 12
-#define GPU_TEMP GPU_UTIL + 6
-#define GPU_SPEED GPU_TEMP + 5
-#define VRAM GPU_SPEED + 13
-#define MEM VRAM + 12
-#define DISK MEM + 10
-#define WEEKDAY DISK + 8
-#define MONTH WEEKDAY + 5
-#define DAY MONTH + 4
-#define HOUR DAY + 3
-#define MINUTE HOUR + 3
-#define SECOND MINUTE + 3
-
-// (I find it hard to believe that anything over T will be useful)
 const char SI_PREFIXES[8] = {'K', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y'};
 
-double last_time_used = 0, last_time_idle = 0, cpu_util = 0, cpu_speed,
-       cpu_temp;
-long int mem_used;
-long int vram_used;
-double disk_util;
-char ip_addr[15], vpn[96];
-size_t ip_addr_len = 0, vpn_len = 0;
-time_t timer;
-struct tm *timer_struct = NULL;
+#define SEPARATOR " | "
+#define OUTPUT \
+	LABEL(vpn_label, "VPN: ") VALUE(vpn, 32) \
+	SEP(5) \
+	LABEL(ip_label, "IP: ") VALUE(ip, 32) \
+	SEP(4) \
+	LABEL(cpu_label, "CPU: ") \
+	VALUE(cpu_usage, 4) LABEL(cpu_usage_unit, "% ") \
+	VALUE(cpu_temp, 4) LABEL(cpu_temp_unit, "° ") \
+	VALUE(cpu_speed, 4) \
+	SEP(1) \
+	LABEL(gpu_label, "GPU: ") \
+	VALUE(gpu_usage, 4) LABEL(gpu_usage_unit, "% ") \
+	VALUE(gpu_temp, 4) LABEL(gpu_temp_unit, "° ") \
+	VALUE(gpu_speed, 4) \
+	SEP(2) \
+	LABEL(vram_label, "VRAM: ") VALUE(vram, 4) \
+	SEP(10) \
+	LABEL(mem_label, "MEM: ") VALUE(mem, 4)\
+	SEP(3) \
+	LABEL(fs_label, "/ AVAIL: ") VALUE(fs, 5) \
+	SEP(11) \
+	VALUE(date, 21) \
+	LABEL(newline, "\n")
 
-nvmlReturn_t nvml_result;
-nvmlDevice_t nvml_device;
-nvmlMemory_t nvml_mem;
-unsigned int nvml_temp;
-nvmlUtilization_t nvml_util;
-unsigned int nvml_clocks;
-
-int is_num(char c)
+struct
 {
-    return c >= '0' && c <= '9';
-}
+#define LABEL(name, val) char name[strlen(val) + 1];
+#define VALUE(name, val) char name[val];
+#define SEP(n) char sep##n[sizeof(SEPARATOR)];
+	OUTPUT
+#undef LABEL
+#undef SEP
+#undef VALUE
+} output;
 
-/**
- * Store a string representation of int `n' at string `str' that is `w'
- * characters wide. If `n' is too long, truncate it. If it's too short, pad the
- * front of it with char `c'.
- *
- * Not implemented for negative numbers.
- */
-void leftpad(int n, char *str, int w, char c)
-{
-    // special case: 0
-    if (n == 0) {
-        str[w - 1] = '0';
-        for (int i = 0; i < w - 1; ++i) str[i] = c;
-        return;
-    }
 
-    int save_n = n;
-    int num_digits = 0;
-    while (n > 0) {
-        n /= 10;
-        ++num_digits;
-    }
-    n = save_n;
-
-    // padding
-    for (int i = 0; i < w - num_digits; ++i) str[i] = c;
-
-    // the number
-    for (int i = w - 1; n > 0; n /= 10) str[i--] = (n % 10) + '0';
-}
+#ifdef SEM
+sem_t *sem;
+#endif
 
 /**
  * A version of leftpad designed for strings of length 2 only.
@@ -121,390 +85,471 @@ void leftpad2(int n, char *str, char c)
  */
 void tofixed(char *s, int w, long double n)
 {
-    int postfix = 0;
-    while (n >= 1024) {
-        ++postfix;
-        n /= 1024;
-    }
+	int postfix = 0;
+	while (n >= 1024) {
+		++postfix;
+		n /= 1024;
+	}
 
-    if (n < 0) {
-        s[0] = '-';
-        n *= -1;
-    }
-    else {
-        s[0] = '+';
-    }
+	if (n < 0) {
+		s[0] = '-';
+		n *= -1;
+	}
+	else {
+		s[0] = '+';
+	}
 
-    int temp = n;
-    int i = s[0] == '-';
+	int temp = n;
+	int i = s[0] == '-';
 
-    // Whole number part {{
-    if (n > 1) {
-        int num_digits = 0;
-        while (temp > 0) {
-            temp /= 10;
-            ++num_digits;
-        }
-        for (int j = num_digits - 1; j >= 0; j--) {
-            int digit = (int)(n / pow(10, j)) % 10;
-            s[i++] = digit + '0';
-            if (i + !!postfix == w) break; // oh no! no more space.
-        }
-    }
-    else {
-        s[i++] = '0';
-    }
-    // }}
+	// Whole number part {{
+	if (n > 1) {
+		int num_digits = 0;
+		while (temp > 0) {
+			temp /= 10;
+			++num_digits;
+		}
+		for (int j = num_digits - 1; j >= 0; j--) {
+			int digit = (int)(n / pow(10, j)) % 10;
+			s[i++] = digit + '0';
+			if (i + !!postfix == w) break; // oh no! no more space.
+		}
+	}
+	else {
+		s[i++] = '0';
+	}
+	// }}
 
-    // decimal part {{
-    if (i + !!postfix < w) s[i++] = '.';
-    for (; i + !!postfix < w; ++i) {
-        n *= 10;
-        s[i] = (n ? ((int)n % 10) : 0) + '0';
-    }
-    // }}
+	// decimal part {{
+	if (i + !!postfix < w) s[i++] = '.';
+	for (; i + !!postfix < w; ++i) {
+		n *= 10;
+		s[i] = (n ? ((int)n % 10) : 0) + '0';
+	}
+	// }}
 
-    if (postfix) s[i] = SI_PREFIXES[postfix - 1];
+	if (postfix) s[i] = SI_PREFIXES[postfix - 1];
 }
 
-void get_vpn(char *str, size_t *len)
+#ifdef PROFILE
+#define THREAD_START                                                           \
+	static clock_t start;                                                  \
+	begin:                                                                 \
+	start = clock();
+#else
+#define THREAD_START                                                           \
+	begin:
+#endif
+#ifdef PROFILE
+#define THREAD_END(label, sleep_time)                                          \
+	fprintf(stderr, "%-32s: %10lu\n", label, clock() - start);             \
+	sleep((int)sleep_time);                                                \
+	goto begin;
+#else
+#define THREAD_END(label, sleep_time)                                          \
+	sleep((int)sleep_time);                                                \
+	goto begin;
+#endif
+
+void *get_vpn(void *arg)
 {
-    FILE *status = popen(
-        "/usr/bin/mullvad "
-        "status",
-        "r"
-    );
-    // Mullvad's location or "None"
-    if (fgetc(status) == 'D') {
-        strcpy(str, "None");
-        *len = 4;
-    }
-    else {
-        int spaces = 0, c;
-        while (spaces < 2) {
-            c = fgetc(status);
-            if (c == ' ') ++spaces;
-        }
-        ungetc(c, status);
-        fscanf(status, "%s", str);
-        *len = strlen(str);
-    }
-    pclose(status);
+	struct ifaddrs *head;
+
+	THREAD_START;
+
+	getifaddrs(&head);
+	for (struct ifaddrs *node = head; node != NULL; node = node->ifa_next) {
+		// FIXME: For now, this number seems to epresent the flags that
+		// wireguard vpns get, but is there a better way to get the VPN
+		// interface? What if more than one vpn is being used? 
+		if (node->ifa_flags == 65745) {
+			#ifdef SEM
+			sem_wait(sem);
+			#endif
+			strncpy(output.vpn, node->ifa_name, sizeof(output.vpn));
+			break;
+		}
+	}
+	if (output.vpn[0] == 0) {
+		strcpy(output.vpn, "None");
+	}
+#ifdef SEM
+	sem_post(sem);
+#endif
+	freeifaddrs(head);
+
+	THREAD_END("VPN", 3);
 }
 
 /** Determine used disk space at / */
 struct statfs a;
-void *get_disk(void *_)
+void *get_disk(void *arg)
 {
-#ifdef PROFILE
-    clock_t start = clock();
+	static double disk_util;
+
+	THREAD_START
+
+	statfs("/", &a);
+	disk_util = a.f_bfree * a.f_bsize;
+#ifdef SEM
+	sem_wait(sem);
 #endif
-    statfs("/", &a);
-    disk_util = (a.f_blocks - a.f_bfree) * a.f_bsize;
-    tofixed(&output[DISK], 5, disk_util);
-#ifdef PROFILE
-    printf("Disk: %ld\n", clock() - start);
+	tofixed(output.fs, 5, disk_util);
+#ifdef SEM
+	sem_post(sem);
 #endif
-    return NULL;
+
+	THREAD_END("disk", arg)
 }
 
-void *get_gpu(void *_)
+void *get_gpu(void *sleep_time)
 {
-#ifdef PROFILE
-    clock_t start = clock();
+	nvmlReturn_t nvml_result;
+	nvmlDevice_t nvml_device;
+	nvmlMemory_t nvml_mem;
+	unsigned int nvml_temp;
+	nvmlUtilization_t nvml_util;
+	unsigned int nvml_clocks;
+
+	// initialize nvml library for get_gpu()
+	nvml_result = nvmlInit();
+	if (nvml_result != NVML_SUCCESS) {
+		printf(
+			"[nvml] Failed to initialize NVML: %s\n",
+			nvmlErrorString(nvml_result)
+		);
+		exit(1);
+	}
+
+	nvml_result = nvmlDeviceGetHandleByIndex(0, &nvml_device);
+	if (NVML_SUCCESS != nvml_result) {
+		printf(
+			"[nvml] Failed to get handle for device %u: %s\n", 0,
+			nvmlErrorString(nvml_result)
+		);
+		goto nvml_err;
+	}
+
+	THREAD_START;
+
+#ifdef SEM
+	sem_wait(sem);
+#endif
+	nvml_result = nvmlDeviceGetMemoryInfo(nvml_device, &nvml_mem);
+	if (nvml_result != NVML_SUCCESS) return NULL;
+	tofixed(output.vram, sizeof(output.vram), nvml_mem.used);
+
+	nvml_result = nvmlDeviceGetTemperature(nvml_device, NVML_TEMPERATURE_GPU, &nvml_temp);
+	if (nvml_result != NVML_SUCCESS) return NULL;
+	tofixed(output.gpu_temp, sizeof(output.gpu_temp), nvml_temp);
+
+	nvml_result = nvmlDeviceGetUtilizationRates(nvml_device, &nvml_util);
+	if (nvml_result != NVML_SUCCESS) return NULL;
+	tofixed(output.gpu_usage, sizeof(output.gpu_usage), nvml_util.gpu);
+
+	nvml_result = nvmlDeviceGetClockInfo(nvml_device, NVML_CLOCK_GRAPHICS, &nvml_clocks);
+	if (nvml_result != NVML_SUCCESS) return NULL;
+	tofixed(output.gpu_speed, sizeof(output.gpu_speed), nvml_clocks * 1000000);
+#ifdef SEM
+	sem_post(sem);
 #endif
 
-    nvml_result = nvmlDeviceGetMemoryInfo(nvml_device, &nvml_mem);
-    if (nvml_result != NVML_SUCCESS) return NULL;
-    tofixed(&output[VRAM], 4, nvml_mem.used);
+	THREAD_END("gpu", sleep_time)
 
-    nvml_result = nvmlDeviceGetTemperature(nvml_device, NVML_TEMPERATURE_GPU, &nvml_temp);
-    if (nvml_result != NVML_SUCCESS) return NULL;
-    tofixed(&output[GPU_TEMP], 2, nvml_temp);
+	nvml_result = nvmlShutdown();
+	if (NVML_SUCCESS != nvml_result)
+		printf("Failed to shutdown NVML: %s\n", nvmlErrorString(nvml_result));
+	return 0;
 
-    nvml_result = nvmlDeviceGetUtilizationRates(nvml_device, &nvml_util);
-    if (nvml_result != NVML_SUCCESS) return NULL;
-    tofixed(&output[GPU_UTIL], 4, nvml_util.gpu);
-
-    nvml_result = nvmlDeviceGetClockInfo(nvml_device, NVML_CLOCK_GRAPHICS, &nvml_clocks);
-    if (nvml_result != NVML_SUCCESS) return NULL;
-    tofixed(&output[GPU_SPEED], 4, nvml_clocks * 1000000);
-
-#ifdef PROFILE
-    printf("GPU: %ld\n", clock() - start);
-#endif
-
-    return NULL;
+nvml_err:
+	nvml_result = nvmlShutdown();
+	if (NVML_SUCCESS != nvml_result)
+		printf("Failed to shutdown NVML: %s\n", nvmlErrorString(nvml_result));
+	exit(1);
 }
 
 /** getifaddrs */
-void *get_ip(char *str, size_t *len)
+void *get_ip(void *arg)
 {
-#ifdef PROFILE
-    clock_t start = clock();
+	THREAD_START;
+
+	struct ifaddrs *head;
+	getifaddrs(&head);
+
+	for (struct ifaddrs *node = head; node != NULL; node = node->ifa_next) {
+		// Only use IPv4
+		if (!node->ifa_addr || node->ifa_addr->sa_family != AF_INET) {
+			continue;
+		}
+
+		// Skip loopback
+		if (node->ifa_flags & IFF_LOOPBACK) {
+			continue;
+		}
+
+		// Ok this is probably the address
+#ifdef SEM
+		sem_wait(sem);
+#endif
+		getnameinfo(
+			node->ifa_addr, sizeof(struct sockaddr_in), output.ip, sizeof(output.ip), NULL,
+			0, NI_NUMERICHOST
+		);
+#ifdef SEM
+		sem_post(sem);
 #endif
 
-    struct ifaddrs *head;
-    getifaddrs(&head);
+		// Assume there are no more addresses.
+		// NOTE: If you have more than one network interface (eth, wlan, etc),
+		// you may want to filter through them differently.
+		break;
+	}
+	freeifaddrs(head);
 
-    for (struct ifaddrs *node = head; node != NULL; node = node->ifa_next) {
-        // Only use IPv4
-        if (!node->ifa_addr || node->ifa_addr->sa_family != AF_INET) {
-            continue;
-        }
-
-        // Skip loopback
-        if (node->ifa_flags & IFF_LOOPBACK) {
-            continue;
-        }
-
-        // Ok this is probably the address
-        getnameinfo(
-            node->ifa_addr, sizeof(struct sockaddr_in), str, NI_MAXHOST, NULL,
-            0, NI_NUMERICHOST
-        );
-        *len = strlen(str);
-
-        // Assume there are no more addresses.
-        // NOTE: If you have more than one network interface (eth, wlan, etc),
-        // you may want to filter through them differently.
-        break;
-    }
-    freeifaddrs(head);
-
-#ifdef PROFILE
-    printf("IP: %ld\n", clock() - start);
-#endif
-
-    return NULL;
+	THREAD_END("ip", arg)
 }
 
 /** reads /proc/meminfo */
-void *get_mem(void *_)
+void *get_mem(void *arg)
 {
-#ifdef PROFILE
-    clock_t start = clock();
+	static FILE *f;
+	static long int total, avail;
+	static char *line;
+	static size_t len;
+
+	THREAD_START
+
+	f = fopen("/proc/meminfo", "r");
+	total = avail = 0;
+	while (!feof(f) && (total == 0 || avail == 0)) {
+		getline(&line, &len, f);
+		if (!strncmp(line, "MemTotal:", sizeof("MemTotal:")-1)) {
+			sscanf(line + 10, "%ld", &total);
+		} else if (!strncmp(line, "MemAvailable:", sizeof("MemAvailable:")-1)) {
+			sscanf(line + 14, "%ld", &avail);
+		}
+		free(line);
+		line = NULL;
+		len = 0;
+	}
+
+#ifdef SEM
+	sem_wait(sem);
 #endif
-
-    FILE *f = fopen("/proc/meminfo", "r");
-
-    if (!f) {
-        perror("f bad");
-        exit(1);
-    }
-
-    char c[14];
-    long int mem_total, mem_free;
-    while (!strcmp(c, "MemTotal:")) {
-        if (fscanf(f, "%9s", c) == EOF) {
-            perror("Could not determine total mem");
-            exit(1);
-        }
-    }
-    fscanf(f, "%ld", &mem_total);
-    while (!strcmp(c, "MemAvailable:")) {
-        if (fscanf(f, "%13s", c) == EOF) {
-            perror("Could not determine available mem");
-            exit(1);
-        }
-    }
-    fscanf(f, "%ld", &mem_free);
-    mem_used = mem_total - mem_free;
-
-    fclose(f);
-
-    tofixed(&output[MEM], 4, mem_used);
-
-#ifdef PROFILE
-    printf("Mem: %ld\n", clock() - start);
+	tofixed(output.mem, sizeof(output.mem), (total - avail) * 1024.);
+#ifdef SEM
+	sem_post(sem);
 #endif
-    return NULL;
+	fclose(f);
+
+	THREAD_END("Mem", arg);
 }
 
-void *get_date(void *_)
+void *get_date(void *arg)
 {
-#ifdef PROFILE
-    clock_t start = clock();
+	static const char MONTHS[12][4] = {
+	    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+	    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+	};
+	static const char WEEKDAYS[7][4] = {
+	    "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat",
+	};
+	static const char *INT_TO_STR_PAD[] = {
+	    "00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10",
+	    "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21",
+	    "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32",
+	    "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43",
+	    "44", "45", "46", "47", "48", "49", "50", "51", "52", "53", "54",
+	    "55", "56", "57", "58", "59", "60",
+	};
+	static const char *INT_TO_STR[] = {
+	    " 0", " 1", " 2", " 3", " 4", " 5", " 6", " 7", " 8", " 9", "10",
+	    "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21",
+	    "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32",
+	    "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43",
+	    "44", "45", "46", "47", "48", "49", "50", "51", "52", "53", "54",
+	    "55", "56", "57", "58", "59", "60",
+	};
+
+	time_t t;
+	struct tm tm = {0};
+
+	memset(output.date, ' ', sizeof(output.date));
+	output.date[10] = ',';
+	output.date[14] = ':';
+	output.date[17] = ':';
+	THREAD_START;
+
+#ifdef SEM
+	sem_wait(sem);
+#endif
+	t = time(NULL);
+	// TODO: gmtime() is much faster than localtime(). But to use gmtime(),
+	// we would have to add the `timezone' global var, and also factor in
+	// `daylight'.
+	tm = *localtime_r(&t, &tm);
+	memcpy(output.date + 0, WEEKDAYS[tm.tm_wday], 3);
+	memcpy(output.date + 4, MONTHS[tm.tm_mon], 3);
+	memcpy(output.date + 8, INT_TO_STR[tm.tm_mday], 2);
+	memcpy(output.date + 12, INT_TO_STR[tm.tm_hour - (tm.tm_hour > 12 ? 12 : 0)], 2);
+	memcpy(output.date + 15, INT_TO_STR_PAD[tm.tm_min], 2);
+	memcpy(output.date + 18, INT_TO_STR_PAD[tm.tm_sec], 2);
+#ifdef SEM
+	sem_post(sem);
 #endif
 
-    timer = time(NULL);
-    timer_struct = localtime(&timer);
-    strncpy(&output[MONTH], MONTHS[timer_struct->tm_mon], 3);
-    strncpy(&output[WEEKDAY], WEEKDAYS[timer_struct->tm_wday], 3);
-    leftpad2(timer_struct->tm_mday, &output[DAY], ' ');
-    leftpad2(
-        timer_struct->tm_hour - (timer_struct->tm_hour > 12 ? 12 : 0),
-        &output[HOUR], ' '
-    );
-    leftpad2(timer_struct->tm_min, &output[MINUTE], ' ');
-    leftpad2(timer_struct->tm_sec, &output[SECOND], ' ');
-
-#ifdef PROFILE
-    printf("Date: %ld\n", clock() - start);
-#endif
-    return NULL;
+	THREAD_END("date", arg)
 }
 
 /** reads /sys/devices/system/cpu */
-void *get_cpu_speed(void *_)
+void *get_cpu_speed(void *arg)
 {
-#ifdef PROFILE
-    clock_t start = clock();
+	static char buf[32];
+	static int fd, n_read;
+	static int cpu_speed;
+	THREAD_START;
+
+	fd = open("/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq", O_RDONLY);
+	n_read = read(fd, buf, 32);
+	buf[n_read] = 0;
+	cpu_speed = atoi(buf);
+
+#ifdef SEM
+	sem_wait(sem);
 #endif
-
-    FILE *f =
-        fopen("/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq", "r");
-    fscanf(f, "%lf", &cpu_speed);
-    fclose(f);
-    tofixed(&output[CPU_SPEED], 4, cpu_speed * 1000);
-
-#ifdef PROFILE
-    printf("CPU speed: %ld\n", clock() - start);
+	tofixed(output.cpu_speed, sizeof(output.cpu_speed), cpu_speed * 1000);
+#ifdef SEM
+	sem_post(sem);
 #endif
+	close(fd);
 
-    return NULL;
+	THREAD_END("CPU Speed", arg)
 }
 
 /** reads /sys/class/hwmon */
-void *get_cpu_temp()
+void *get_cpu_temp(void *arg)
 {
-#ifdef PROFILE
-    clock_t start = clock();
+	static char buf[32];
+	static int fd, n_read;
+	static int cpu_temp;
+	THREAD_START;
+
+	fd = open("/sys/class/hwmon/hwmon0/temp1_input", O_RDONLY);
+	n_read = read(fd, buf, 32);
+	buf[n_read] = 0;
+	cpu_temp = atoi(buf);
+
+#ifdef SEM
+	sem_wait(sem);
+#endif
+	tofixed(output.cpu_temp, sizeof(output.cpu_temp), cpu_temp / 1000.);
+	close(fd);
+#ifdef SEM
+	sem_post(sem);
 #endif
 
-    FILE *f = fopen("/sys/class/hwmon/hwmon0/temp1_input", "r");
-    fscanf(f, "%lf", &cpu_temp);
-    fclose(f);
-    tofixed(&output[CPU_TEMP], 4, cpu_temp / 1000);
-
-#ifdef PROFILE
-    printf("CPU temp: %ld\n", clock() - start);
-#endif
-
-    return NULL;
+	THREAD_END("CPU Temp", arg)
 }
 
 /** reads /proc/stat */
-void *get_cpu_util(void *_)
+void *get_cpu_util(void *arg)
 {
-#ifdef PROFILE
-    clock_t start = clock();
+	double user, nice, system, idle;
+	double last_time_used = 0, last_time_idle = 0, cpu_util = 0;
+
+	THREAD_START;
+
+	FILE *f = fopen("/proc/stat", "r");
+	char *line = NULL, temp[96];
+	size_t len = 96;
+	getline(&line, &len, f);
+	sscanf(line, "%s %lf %lf %lf %lf", temp, &user, &nice, &system, &idle);
+	free(line);
+
+	if (last_time_idle > 0) {
+		cpu_util =
+			(user + nice + system - last_time_used) / (idle - last_time_idle);
+	}
+
+	last_time_used = user + nice + system;
+	last_time_idle = idle;
+
+#ifdef SEM
+	sem_wait(sem);
 #endif
-
-    double user, nice, system, idle;
-
-    FILE *f = fopen("/proc/stat", "r");
-    char *line = NULL, temp[96];
-    size_t len = 96;
-    getline(&line, &len, f);
-    sscanf(line, "%s %lf %lf %lf %lf", temp, &user, &nice, &system, &idle);
-    free(line);
-    fclose(f);
-
-    if (last_time_idle > 0) {
-        cpu_util =
-            (user + nice + system - last_time_used) / (idle - last_time_idle);
-    }
-
-    last_time_used = user + nice + system;
-    last_time_idle = idle;
-
-    tofixed(&output[CPU_UTIL], 4, cpu_util * 100);
-
-#ifdef PROFILE
-    printf("CPU util: %ld\n", clock() - start);
+	tofixed(output.cpu_usage, sizeof(output.cpu_usage), cpu_util * 100);
+#ifdef SEM
+	sem_post(sem);
 #endif
+	fclose(f);
 
-    return NULL;
+	THREAD_END("CPU Util", arg);
 }
 
 int main(int argc, char **argv)
 {
+	int one_shot = 0, wait = 1;
+	for (int i = 0; i < argc; ++i) {
+		if (!strcmp(argv[i], "-1") || !strcmp(argv[i], "--one-shot")) {
+			one_shot = 1;
+		} else if (!strcmp(argv[i], "--no-wait")) {
+			wait = 0;
+		}
+	}
 
-    int one_shot = 0;
-    for (int i = 0; i < argc; ++i) {
-        if (strcmp(argv[i], "-1") == 0) {
-            one_shot = 1;
-        }
-    }
+	#define LABEL(name, value) strcpy(output.name, value);
+	#define VALUE(name, value)
+	#define SEP(n) strcpy(output.sep##n, SEPARATOR);
+	OUTPUT
+	#undef LABEL
+	#undef VALUE
+	#undef SEP
 
-    // initialize nvml library for get_gpu()
-    nvml_result = nvmlInit();
-    if (nvml_result != NVML_SUCCESS) {
-        printf(
-            "[nvml] Failed to initialize NVML: %s\n",
-            nvmlErrorString(nvml_result)
-        );
-        exit(1);
-    }
-
-    nvml_result = nvmlDeviceGetHandleByIndex(0, &nvml_device);
-    if (NVML_SUCCESS != nvml_result) {
-        printf(
-            "[nvml] Failed to get handle for device %u: %s\n", 0,
-            nvmlErrorString(nvml_result)
-        );
-        goto nvml_Error;
-    }
-
-    pthread_t threads[10];
-    int thread_i;
-
-    for (int t = 0; 1; ++t) {
-
-#ifdef PROFILE
-        clock_t start = clock();
+	#define N_THREADS 9
+#ifdef SEM
+	sem = sem_open("sem", O_CREAT, O_RDWR, N_THREADS);
 #endif
-        thread_i = 0;
-        pthread_create(&threads[thread_i++], NULL, get_date, NULL);
+	pthread_t threads[N_THREADS] = {
+		pthread_create(&threads[0], NULL, get_gpu, (void *)(wait ? 4 : 0)),
+		pthread_create(&threads[1], NULL, get_mem, (void *)(wait ? 4 : 0)),
+		pthread_create(&threads[2], NULL, get_cpu_util, (void *)(wait ? 4 : 0)),
+		pthread_create(&threads[3], NULL, get_cpu_temp, (void *)(wait ? 4 : 0)),
+		pthread_create(&threads[4], NULL, get_cpu_speed, (void *)(wait ? 4 : 0)),
+		pthread_create(&threads[5], NULL, get_disk, (void *)(wait ? 4 : 0)),
+		pthread_create(&threads[6], NULL, get_vpn, (void *)(wait ? 4 : 0)),
+		pthread_create(&threads[7], NULL, get_ip, (void *)(wait ? 4 : 0)),
+		pthread_create(&threads[8], NULL, get_date, (void *)(wait ? 1 : 0))
+	};
 
-        if (t % 4 == 0) {
-            pthread_create(&threads[thread_i++], NULL, get_gpu, NULL);
-            pthread_create(&threads[thread_i++], NULL, get_mem, NULL);
-            pthread_create(&threads[thread_i++], NULL, get_cpu_util, NULL);
-            pthread_create(&threads[thread_i++], NULL, get_cpu_temp, NULL);
-            pthread_create(&threads[thread_i++], NULL, get_cpu_speed, NULL);
-        }
-
-        if (t % 4 == 0) {
-            pthread_create(&threads[thread_i++], NULL, get_disk, NULL);
-            get_ip(ip_addr, &ip_addr_len);
-            get_vpn(vpn, &vpn_len);
-        }
-
-        // wait for any threads to finish
-        for (int i = 0; i < thread_i; ++i) pthread_join(threads[i], NULL);
-
-        // check for any errors that might have happened in a thread
-        if (nvml_result != NVML_SUCCESS) {
-            printf("[nvml] %s\n", nvmlErrorString(nvml_result));
-            goto nvml_Error;
-        }
-
+	char buf[sizeof(output)], *ptr;
+	do {
 #ifdef PROFILE
-        printf("**TOTAL: %ld\n\n", clock() - start);
-#else
-        fwrite("VPN: ", 1, 5, stdout);
-        fwrite(vpn, 1, vpn_len, stdout);
-        fwrite(" | NET: ", 1, 8, stdout);
-        fwrite(ip_addr, 1, ip_addr_len, stdout);
-        fwrite(output, 1, sizeof(output), stdout);
-        fflush(stdout);
+		clock_t start = clock();
 #endif
 
-        if (one_shot) break;
+#ifdef SEM
+		for (int i = 0 ; i < N_THREADS; ++i) sem_wait(sem);
+#endif
+		ptr = buf;
+		for (int i = 0; i < sizeof(output); ++i) {
+			char c = ((char *)&output)[i];
+			if (c) {
+				*ptr++ = c;
+			}
+		}
+		write(1, buf, ptr - buf);
+#ifdef SEM
+		for (int i = 0 ; i < N_THREADS; ++i) sem_post(sem);
+#endif
 
-        sleep(1);
-    }
+#ifdef PROFILE
+		fprintf(stderr, "%s: %ld\n", "Total", clock() - start);
+#endif
 
-    nvml_result = nvmlShutdown();
-    if (NVML_SUCCESS != nvml_result)
-        printf("Failed to shutdown NVML: %s\n", nvmlErrorString(nvml_result));
-    return 0;
+		if (wait) {
+			sleep(1);
+		}
+	} while (!one_shot);
 
-nvml_Error:
-    nvml_result = nvmlShutdown();
-    if (NVML_SUCCESS != nvml_result)
-        printf("Failed to shutdown NVML: %s\n", nvmlErrorString(nvml_result));
-    exit(1);
+	return 0;
 }
