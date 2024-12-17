@@ -158,6 +158,7 @@ void *get_vpn(void *arg)
 	THREAD_START;
 
 	getifaddrs(&head);
+	output.vpn[0] = 0;
 	for (struct ifaddrs *node = head; node != NULL; node = node->ifa_next) {
 		// FIXME: For now, this number seems to epresent the flags that
 		// wireguard vpns get, but is there a better way to get the VPN
